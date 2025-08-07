@@ -20,9 +20,6 @@ TELEGRAM_POST_COUNT = 1
 SCROLL_PAUSE = (2, 5)
 MAX_SCROLLS = 40
 
-# ─── LOCAL HEURISTIC CONFIG ─────────────────────────────────────────────────────
-# We replace the AI API call with a simple free heuristic for ad headlines
-# No external API calls needed
 # ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -44,6 +41,7 @@ def init_headless_driver(user_agent=None):
     options.add_argument("--headless")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")  # CI-friendly
     options.add_argument("--window-size=1920,1080")
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     try:
@@ -68,11 +66,17 @@ def fetch_full_title_and_image(url):
         title_elem = driver.find_element(By.ID, "productTitle")
         full_title = title_elem.text.strip()
         image_url = None
+        # Try main image
         try:
-            image_elem = driver.find_element(By.ID, "landingImage")
-            image_url = image_elem.get_attribute("src")
+            img = driver.find_element(By.ID, "landingImage")
+            image_url = img.get_attribute("src")
         except:
-            pass
+            # Fallback: first thumbnail
+            try:
+                thumb = driver.find_element(By.CSS_SELECTOR, "ul.a-unordered-list.a-nostyle.a-horizontal li img")
+                image_url = thumb.get_attribute("src")
+            except:
+                pass
         return full_title, image_url
     except Exception as e:
         logging.error(f"Error fetching title/image: {e}")
@@ -81,7 +85,6 @@ def fetch_full_title_and_image(url):
         driver.quit()
 
 # ─── GENERATE CLEANED AD COPY VIA RAKE ─────────────────────────────────────
-# Requires: pip install rake-nltk
 import nltk
 from rake_nltk import Rake
 
@@ -95,28 +98,20 @@ try:
 except LookupError:
     nltk.download('punkt')
 
-# Initialize RAKE once without using punkt tokenizer
 rake = Rake()
-# Override sentence tokenizer to avoid missing punkt_tab resource
 rake.sentence_tokenizer = lambda text: [text]
 
 def rewrite_title(original_title, discount):
-    """
-    Use RAKE to extract top keyphrases and create an ad headline.
-    """
-    # Extract keywords/phrases
     rake.extract_keywords_from_text(original_title)
     phrases = rake.get_ranked_phrases()
-    # Select top 3 phrases
     top = phrases[:3]
     if not top:
         short = original_title if len(original_title) <= 50 else original_title[:47] + "..."
         return f"Save {discount}% on {short} – Shop Now!"
-    # Build title from phrases
     headline = " – ".join([p.title() for p in top])
     return f"{headline} – Save {discount}% Now!"
 
-# ─── SCRAPE AMAZON DEALS ─────────────────────────────────────────────────────── ───────────────────────────────────────────────────────
+# ─── SCRAPE AMAZON DEALS ───────────────────────────────────────────────────────
 def get_amazon_deals():
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36",
@@ -134,28 +129,33 @@ def get_amazon_deals():
             driver.execute_script("window.scrollBy(0, window.innerHeight);")
             time.sleep(random.uniform(*SCROLL_PAUSE))
             scrolls += 1
-            badges = driver.find_elements(By.XPATH, "//span[contains(text(), '%')]")
-            for badge in badges:
+            cards = driver.find_elements(By.XPATH, "//div[contains(@class,'DealContent-module__grid')]//a[contains(@href,'/dp/')]")
+            for card in cards:
                 try:
+                    badge = card.find_element(By.XPATH, ".//span[contains(text(), '%')]")
                     pct = int(re.search(r"(\d{1,3})%", badge.text).group(1))
+                    if pct < MIN_DISCOUNT:
+                        continue
                 except:
                     continue
-                if pct < MIN_DISCOUNT:
-                    continue
-                try:
-                    link_elem = badge.find_element(By.XPATH, ".//ancestor::a[contains(@href,'/dp/')]")
-                    raw_link = link_elem.get_attribute("href").split("?", 1)[0]
-                    link = re.sub(r"https://www\\.amazon\\.[a-z.]+", "https://www.amazon.com", raw_link)
-                except:
-                    continue
+                link = card.get_attribute("href").split("?",1)[0]
+                link = re.sub(r"https://www\\.amazon\\.[a-z.]+", "https://www.amazon.com", link)
                 if link in seen:
                     continue
                 seen.add(link)
+                # Extract image
+                img_url = None
+                try:
+                    img_elem = card.find_element(By.TAG_NAME, 'img')
+                    img_url = img_elem.get_attribute('src')
+                except:
+                    pass
+                temp_title = card.get_attribute('aria-label') or ''
                 deals.append({
-                    "temp_title": link_elem.get_attribute("aria-label") or "",
-                    "link": link,
-                    "discount": pct,
-                    "image_url": None
+                    'temp_title': temp_title,
+                    'link': link,
+                    'discount': pct,
+                    'image_url': img_url
                 })
         return deals
     finally:
@@ -170,26 +170,36 @@ def post_to_telegram(deals):
             continue
         used.add(idx)
         d = deals[idx]
-        title_raw, img_fallback = fetch_full_title_and_image(d["link"])
+        title_raw, img_fallback = fetch_full_title_and_image(d['link'])
         if not title_raw:
-            title_raw = d["temp_title"]
-        if not d.get("image_url") and img_fallback:
-            d["image_url"] = img_fallback
+            title_raw = d['temp_title']
+        if not d.get('image_url') and img_fallback:
+            d['image_url'] = img_fallback
         new_ad = rewrite_title(title_raw, d['discount'])
-        link_short = shorten_link(d["link"])
+        link_short = shorten_link(d['link'])
         msg = (
-            f"<b>{new_ad}</b>"
-            f"<u><a href=\"{link_short}\">Buy Now</a></u>"
+            f"<b>{new_ad}</b>\n"
+            f"<a href=\"{link_short}\">Buy Now</a>"
         )
-        if d.get("image_url"):
+        if d.get('image_url'):
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data={"chat_id": CHANNEL_USERNAME, "photo": d["image_url"], "caption": msg, "parse_mode": "HTML"},
+                data={
+                    'chat_id': CHANNEL_USERNAME,
+                    'photo': d['image_url'],
+                    'caption': msg,
+                    'parse_mode': 'HTML'
+                }
             )
         else:
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": CHANNEL_USERNAME, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
+                data={
+                    'chat_id': CHANNEL_USERNAME,
+                    'text': msg,
+                    'parse_mode': 'HTML',
+                    'disable_web_page_preview': True
+                }
             )
         sent += 1
 
