@@ -10,8 +10,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-from rake_nltk import Rake
-import nltk
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = "8460257816:AAH-RjlgE5l-qnb----01bp-PGNedzY0jug"
@@ -22,20 +20,11 @@ TELEGRAM_POST_COUNT = 1
 SCROLL_PAUSE = (2, 5)
 MAX_SCROLLS = 40
 
+# ─── LOCAL HEURISTIC CONFIG ─────────────────────────────────────────────────────
+# We replace the AI API call with a simple free heuristic for ad headlines
+# No external API calls needed
 # ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# ─── DOWNLOAD NLTK DATA ────────────────────────────────────────────────────────
-for pkg in ["stopwords", "punkt"]:
-    try:
-        nltk.data.find(f"corpora/{pkg}")
-    except LookupError:
-        nltk.download(pkg)
-
-# ─── INITIALIZE RAKE ─────────────────────────────────────────────────────────
-rake = Rake()
-# Treat entire title as single sentence to avoid punkt_tab
-rake.sentence_tokenizer = lambda text: [text]
 
 # ─── UTILITIES ─────────────────────────────────────────────────────────────────
 def shorten_link(long_url):
@@ -91,21 +80,43 @@ def fetch_full_title_and_image(url):
     finally:
         driver.quit()
 
-# ─── GENERATE CLEANED AD COPY VIA RAKE ─────────────────────────────────────────
+# ─── GENERATE CLEANED AD COPY VIA RAKE ─────────────────────────────────────
+# Requires: pip install rake-nltk
+import nltk
+from rake_nltk import Rake
+
+# Ensure NLTK stopwords and punkt tokenizer are downloaded
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+# Initialize RAKE once without using punkt tokenizer
+rake = Rake()
+# Override sentence tokenizer to avoid missing punkt_tab resource
+rake.sentence_tokenizer = lambda text: [text]
+
 def rewrite_title(original_title, discount):
     """
-    Extract top phrases with RAKE and form headline.
+    Use RAKE to extract top keyphrases and create an ad headline.
     """
+    # Extract keywords/phrases
     rake.extract_keywords_from_text(original_title)
     phrases = rake.get_ranked_phrases()
+    # Select top 3 phrases
     top = phrases[:3]
     if not top:
         short = original_title if len(original_title) <= 50 else original_title[:47] + "..."
         return f"Save {discount}% on {short} – Shop Now!"
+    # Build title from phrases
     headline = " – ".join([p.title() for p in top])
     return f"{headline} – Save {discount}% Now!"
 
-# ─── SCRAPE AMAZON DEALS ───────────────────────────────────────────────────────
+# ─── SCRAPE AMAZON DEALS ─────────────────────────────────────────────────────── ───────────────────────────────────────────────────────
 def get_amazon_deals():
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36",
@@ -166,7 +177,10 @@ def post_to_telegram(deals):
             d["image_url"] = img_fallback
         new_ad = rewrite_title(title_raw, d['discount'])
         link_short = shorten_link(d["link"])
-        msg = f"<b>{new_ad}</b>\n\n<u><a href=\"{link_short}\">Buy Now</a></u>"
+        msg = (
+            f"<b>{new_ad}</b>"
+            f"<u><a href=\"{link_short}\">Buy Now</a></u>"
+        )
         if d.get("image_url"):
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
