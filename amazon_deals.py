@@ -23,6 +23,7 @@ MAX_SCROLLS = 40
 # ─── LOCAL HEURISTIC CONFIG ─────────────────────────────────────────────────────
 # We replace the AI API call with a simple free heuristic for ad headlines
 # No external API calls needed
+
 # ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -45,6 +46,8 @@ def init_headless_driver(user_agent=None):
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--window-size=1920,1080")
+    # Explicitly set binary location for GitHub Actions
+    options.binary_location = "/usr/bin/chromium-browser"
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     try:
         driver.execute_cdp_cmd('Network.enable', {})
@@ -72,7 +75,7 @@ def fetch_full_title_and_image(url):
             image_elem = driver.find_element(By.ID, "landingImage")
             image_url = image_elem.get_attribute("src")
         except:
-            pass
+            logging.warning(f"No landingImage element found for URL: {url}")
         return full_title, image_url
     except Exception as e:
         logging.error(f"Error fetching title/image: {e}")
@@ -81,7 +84,6 @@ def fetch_full_title_and_image(url):
         driver.quit()
 
 # ─── GENERATE CLEANED AD COPY VIA RAKE ─────────────────────────────────────
-# Requires: pip install rake-nltk
 import nltk
 from rake_nltk import Rake
 
@@ -101,22 +103,17 @@ rake = Rake()
 rake.sentence_tokenizer = lambda text: [text]
 
 def rewrite_title(original_title, discount):
-    """
-    Use RAKE to extract top keyphrases and create an ad headline.
-    """
     # Extract keywords/phrases
     rake.extract_keywords_from_text(original_title)
     phrases = rake.get_ranked_phrases()
-    # Select top 3 phrases
     top = phrases[:3]
     if not top:
         short = original_title if len(original_title) <= 50 else original_title[:47] + "..."
         return f"Save {discount}% on {short} – Shop Now!"
-    # Build title from phrases
     headline = " – ".join([p.title() for p in top])
     return f"{headline} – Save {discount}% Now!"
 
-# ─── SCRAPE AMAZON DEALS ─────────────────────────────────────────────────────── ───────────────────────────────────────────────────────
+# ─── SCRAPE AMAZON DEALS ───────────────────────────────────────────────────────
 def get_amazon_deals():
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36",
@@ -146,58 +143,3 @@ def get_amazon_deals():
                     link_elem = badge.find_element(By.XPATH, ".//ancestor::a[contains(@href,'/dp/')]")
                     raw_link = link_elem.get_attribute("href").split("?", 1)[0]
                     link = re.sub(r"https://www\\.amazon\\.[a-z.]+", "https://www.amazon.com", raw_link)
-                except:
-                    continue
-                if link in seen:
-                    continue
-                seen.add(link)
-                deals.append({
-                    "temp_title": link_elem.get_attribute("aria-label") or "",
-                    "link": link,
-                    "discount": pct,
-                    "image_url": None
-                })
-        return deals
-    finally:
-        driver.quit()
-
-# ─── POST TO TELEGRAM ──────────────────────────────────────────────────────────
-def post_to_telegram(deals):
-    sent, used = 0, set()
-    while sent < TELEGRAM_POST_COUNT and len(used) < len(deals):
-        idx = random.randrange(len(deals))
-        if idx in used:
-            continue
-        used.add(idx)
-        d = deals[idx]
-        title_raw, img_fallback = fetch_full_title_and_image(d["link"])
-        if not title_raw:
-            title_raw = d["temp_title"]
-        if not d.get("image_url") and img_fallback:
-            d["image_url"] = img_fallback
-        new_ad = rewrite_title(title_raw, d['discount'])
-        link_short = shorten_link(d["link"])
-        msg = (
-            f"<b>{new_ad}</b>"
-            f"<u><a href=\"{link_short}\">Buy Now</a></u>"
-        )
-        if d.get("image_url"):
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data={"chat_id": CHANNEL_USERNAME, "photo": d["image_url"], "caption": msg, "parse_mode": "HTML"},
-            )
-        else:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": CHANNEL_USERNAME, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
-            )
-        sent += 1
-
-# ─── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    deals = get_amazon_deals()
-    if not deals:
-        print(f"No deals found with >= {MIN_DISCOUNT}% discount.")
-    else:
-        post_to_telegram(deals)
-        print(f"Posted {TELEGRAM_POST_COUNT} of {len(deals)} deals.")
