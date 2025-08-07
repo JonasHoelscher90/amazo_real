@@ -10,21 +10,35 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = "8460257816:AAH-RjlgE5l-qnb----01bp-PGNedzY0jug"
 CHANNEL_USERNAME = "@amaz0n_deal5"
 MIN_DISCOUNT = 30
 DESIRED_DEALS = 50
-TELEGRAM_POST_COUNT = 1
+TELEGRAM_POST_COUNT = 2
 SCROLL_PAUSE = (2, 5)
 MAX_SCROLLS = 40
+MODEL_NAME = "google/flan-t5-large"
 
-# ─── LOCAL HEURISTIC CONFIG ─────────────────────────────────────────────────────
-# We replace the AI API call with a simple free heuristic for ad headlines
-# No external API calls needed
 # ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ─── INITIALIZE MODEL & PIPELINE ───────────────────────────────────────────────
+logging.info(f"Loading model {MODEL_NAME}...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+ad_pipeline = pipeline(
+    task="text2text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_length=250,               # ample space for rationale + headline
+    do_sample=True,
+    temperature=1.2,              # creative variability
+    top_p=0.95,                   # nucleus sampling
+    num_return_sequences=5,       # multiple options
+)
 
 # ─── UTILITIES ─────────────────────────────────────────────────────────────────
 def shorten_link(long_url):
@@ -80,43 +94,47 @@ def fetch_full_title_and_image(url):
     finally:
         driver.quit()
 
-# ─── GENERATE CLEANED AD COPY VIA RAKE ─────────────────────────────────────
-# Requires: pip install rake-nltk
-import nltk
-from rake_nltk import Rake
-
-# Ensure NLTK stopwords and punkt tokenizer are downloaded
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords')
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-
-# Initialize RAKE once without using punkt tokenizer
-rake = Rake()
-# Override sentence tokenizer to avoid missing punkt_tab resource
-rake.sentence_tokenizer = lambda text: [text]
-
-def rewrite_title(original_title, discount):
+# ─── GENERATE LOGICAL, CREATIVE AD COPY ─────────────────────────────────────────
+def rewrite_title(original_title):
     """
-    Use RAKE to extract top keyphrases and create an ad headline.
+    Generate a coherent, benefit-driven ad headline with a brief rationale.
+    - Step 1: Identify the key benefit or use-case.
+    - Step 2: Craft a punchy headline (<=100 chars) based on that benefit.
     """
-    # Extract keywords/phrases
-    rake.extract_keywords_from_text(original_title)
-    phrases = rake.get_ranked_phrases()
-    # Select top 3 phrases
-    top = phrases[:3]
-    if not top:
-        short = original_title if len(original_title) <= 50 else original_title[:47] + "..."
-        return f"Save {discount}% on {short} – Shop Now!"
-    # Build title from phrases
-    headline = " – ".join([p.title() for p in top])
-    return f"{headline} – Save {discount}% Now!"
+    prompt = (
+        "You are a marketing strategist AI. First, in one concise sentence, identify the single most compelling benefit or use-case of this product. "
+        "Then, write a powerful English ad headline (<=100 characters) that highlights that benefit and includes a clear call-to-action. "
+        "Do NOT reuse words from the title. Format:\n"
+        "Benefit: <your sentence>\n"
+        "Headline: <your headline>\n\n"
+        f"Product: {original_title}\n"
+    )
+    logging.info(f"Generating ad for: {original_title}")
+    try:
+        outputs = ad_pipeline(prompt)
+        # Parse candidates, choose the one with logical structure
+        best = None
+        for o in outputs:
+            text = o['generated_text'].strip()
+            if text.startswith("Benefit:") and "Headline:" in text:
+                # take the full block
+                block = text.split("Headline:", 1)[1].strip()
+                # extract just the headline line
+                headline = block.split("\n")[0].strip()
+                if len(headline) <= 100:
+                    best = headline
+                    break
+        if not best:
+            # fallback: first candidate's last line
+            lines = outputs[0]['generated_text'].strip().splitlines()
+            possible = [l for l in lines if len(l) <= 100 and l != lines[0]]
+            best = possible[0] if possible else lines[-1][:100].strip()
+        return best
+    except Exception as e:
+        logging.error(f"Ad generation failed: {e}")
+        return "Discover this amazing product today!"
 
-# ─── SCRAPE AMAZON DEALS ─────────────────────────────────────────────────────── ───────────────────────────────────────────────────────
+# ─── SCRAPE AMAZON DEALS ───────────────────────────────────────────────────────
 def get_amazon_deals():
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36",
@@ -175,11 +193,11 @@ def post_to_telegram(deals):
             title_raw = d["temp_title"]
         if not d.get("image_url") and img_fallback:
             d["image_url"] = img_fallback
-        new_ad = rewrite_title(title_raw, d['discount'])
+        new_ad = rewrite_title(title_raw)
         link_short = shorten_link(d["link"])
         msg = (
-            f"<b>{new_ad}</b>"
-            f"<u><a href=\"{link_short}\">Buy Now</a></u>"
+            f"<b>{new_ad}</b>\n"
+            f"<u><a href=\"{link_short}\">Buy Now</a></u> <b>{d['discount']}% off</b>"
         )
         if d.get("image_url"):
             requests.post(
