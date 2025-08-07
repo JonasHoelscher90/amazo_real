@@ -23,7 +23,6 @@ MAX_SCROLLS = 40
 # ─── LOCAL HEURISTIC CONFIG ─────────────────────────────────────────────────────
 # We replace the AI API call with a simple free heuristic for ad headlines
 # No external API calls needed
-
 # ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -46,8 +45,6 @@ def init_headless_driver(user_agent=None):
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--window-size=1920,1080")
-    # Ensure using Chromium installed in GitHub Actions
-    options.binary_location = "/usr/bin/chromium-browser"
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     try:
         driver.execute_cdp_cmd('Network.enable', {})
@@ -66,7 +63,6 @@ def fetch_full_title_and_image(url):
     driver = init_headless_driver(random.choice(user_agents))
     try:
         url_with_lang = url + ("&language=en_US" if "?" in url else "?language=en_US")
-        logging.info(f"Opening URL for image fetch: {url_with_lang}")
         driver.get(url_with_lang)
         WebDriverWait(driver, 30).until(EC.visibility_of_element_located((By.ID, "productTitle")))
         title_elem = driver.find_element(By.ID, "productTitle")
@@ -75,9 +71,8 @@ def fetch_full_title_and_image(url):
         try:
             image_elem = driver.find_element(By.ID, "landingImage")
             image_url = image_elem.get_attribute("src")
-            logging.info(f"Image URL found: {image_url}")
-        except Exception:
-            logging.warning(f"No landingImage element found for URL: {url}")
+        except:
+            pass
         return full_title, image_url
     except Exception as e:
         logging.error(f"Error fetching title/image: {e}")
@@ -86,6 +81,7 @@ def fetch_full_title_and_image(url):
         driver.quit()
 
 # ─── GENERATE CLEANED AD COPY VIA RAKE ─────────────────────────────────────
+# Requires: pip install rake-nltk
 import nltk
 from rake_nltk import Rake
 
@@ -108,16 +104,19 @@ def rewrite_title(original_title, discount):
     """
     Use RAKE to extract top keyphrases and create an ad headline.
     """
+    # Extract keywords/phrases
     rake.extract_keywords_from_text(original_title)
     phrases = rake.get_ranked_phrases()
+    # Select top 3 phrases
     top = phrases[:3]
     if not top:
         short = original_title if len(original_title) <= 50 else original_title[:47] + "..."
         return f"Save {discount}% on {short} – Shop Now!"
+    # Build title from phrases
     headline = " – ".join([p.title() for p in top])
     return f"{headline} – Save {discount}% Now!"
 
-# ─── SCRAPE AMAZON DEALS ───────────────────────────────────────────────────────
+# ─── SCRAPE AMAZON DEALS ─────────────────────────────────────────────────────── ───────────────────────────────────────────────────────
 def get_amazon_deals():
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36",
@@ -139,7 +138,7 @@ def get_amazon_deals():
             for badge in badges:
                 try:
                     pct = int(re.search(r"(\d{1,3})%", badge.text).group(1))
-                except Exception:
+                except:
                     continue
                 if pct < MIN_DISCOUNT:
                     continue
@@ -147,7 +146,7 @@ def get_amazon_deals():
                     link_elem = badge.find_element(By.XPATH, ".//ancestor::a[contains(@href,'/dp/')]")
                     raw_link = link_elem.get_attribute("href").split("?", 1)[0]
                     link = re.sub(r"https://www\\.amazon\\.[a-z.]+", "https://www.amazon.com", raw_link)
-                except Exception:
+                except:
                     continue
                 if link in seen:
                     continue
