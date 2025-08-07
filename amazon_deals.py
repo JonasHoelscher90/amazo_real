@@ -1,3 +1,4 @@
+import os
 import random
 import time
 import logging
@@ -10,85 +11,62 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+import nltk
+from rake_nltk import Rake
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8460257816:AAH-RjlgE5l-qnb----01bp-PGNedzY0jug"
-CHANNEL_USERNAME = "@amaz0n_deal5"
-MIN_DISCOUNT = 30
-DESIRED_DEALS = 50
-TELEGRAM_POST_COUNT = 1
-SCROLL_PAUSE = (2, 5)
-MAX_SCROLLS = 40
+BOT_TOKEN            = os.getenv("TELEGRAM_BOT_TOKEN",      "8460257816:AAH-RjlgE5l-qnb----01bp-PGNedzY0jug")
+CHANNEL_USERNAME     = os.getenv("TELEGRAM_CHANNEL_USERNAME","@amaz0n_deal5")
+MIN_DISCOUNT         = 30
+DESIRED_DEALS        = 50
+TELEGRAM_POST_COUNT  = 1
+SCROLL_PAUSE         = (2, 5)
+MAX_SCROLLS          = 40
+SELENIUM_RETRY_COUNT = 3
+SELENIUM_RETRY_DELAY = 5  # seconds
 
-# ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
+# ─── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ─── UTILITIES ─────────────────────────────────────────────────────────────────
 def shorten_link(long_url):
     try:
-        resp = requests.get("http://tinyurl.com/api-create", params={"url": long_url}, timeout=5)
-        resp.raise_for_status()
-        return resp.text.strip()
-    except Exception:
+        r = requests.get("http://tinyurl.com/api-create", params={"url": long_url}, timeout=5)
+        r.raise_for_status()
+        return r.text.strip()
+    except:
         return long_url
 
-# ─── CHROME DRIVER SETUP ───────────────────────────────────────────────────────
-def init_headless_driver(user_agent=None):
-    options = Options()
-    options.add_argument("--lang=en-US")
-    if user_agent:
-        options.add_argument(f"--user-agent={user_agent}")
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")  # CI-friendly
-    options.add_argument("--window-size=1920,1080")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    try:
-        driver.execute_cdp_cmd('Network.enable', {})
-        driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {'headers': {'Accept-Language': 'en-US'}})
-    except Exception:
-        pass
-    return driver
-
-# ─── FETCH TITLE & IMAGE ──────────────────────────────────────────────────────
-def fetch_full_title_and_image(url):
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36",
-    ]
-    driver = init_headless_driver(random.choice(user_agents))
-    try:
-        url_with_lang = url + ("&language=en_US" if "?" in url else "?language=en_US")
-        driver.get(url_with_lang)
-        WebDriverWait(driver, 30).until(EC.visibility_of_element_located((By.ID, "productTitle")))
-        title_elem = driver.find_element(By.ID, "productTitle")
-        full_title = title_elem.text.strip()
-        image_url = None
-        # Try main image
+# ─── SELENIUM DRIVER SETUP ─────────────────────────────────────────────────────
+def init_headless_driver():
+    """Try to init ChromeDriver up to SELENIUM_RETRY_COUNT times, with container-friendly flags."""
+    last_err = None
+    for attempt in range(1, SELENIUM_RETRY_COUNT + 1):
         try:
-            img = driver.find_element(By.ID, "landingImage")
-            image_url = img.get_attribute("src")
-        except:
-            # Fallback: first thumbnail
-            try:
-                thumb = driver.find_element(By.CSS_SELECTOR, "ul.a-unordered-list.a-nostyle.a-horizontal li img")
-                image_url = thumb.get_attribute("src")
-            except:
-                pass
-        return full_title, image_url
-    except Exception as e:
-        logging.error(f"Error fetching title/image: {e}")
-        return "", None
-    finally:
-        driver.quit()
+            opts = Options()
+            opts.add_argument("--headless=new")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-extensions")
+            opts.add_argument("--disable-software-rasterizer")
+            opts.add_argument("--single-process")
+            opts.add_argument("--remote-debugging-port=9222")
+            opts.add_argument("--window-size=1920,1080")
+            opts.add_argument("--lang=en-US")
+            driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=opts
+            )
+            return driver
+        except Exception as e:
+            last_err = e
+            logging.warning(f"ChromeDriver init attempt {attempt} failed: {e}")
+            time.sleep(SELENIUM_RETRY_DELAY)
+    logging.error(f"All ChromeDriver init attempts failed: {last_err}")
+    raise last_err
 
-# ─── GENERATE CLEANED AD COPY VIA RAKE ─────────────────────────────────────
-import nltk
-from rake_nltk import Rake
-
-# Ensure NLTK stopwords and punkt tokenizer are downloaded
+# ─── NLTK / RAKE SETUP ─────────────────────────────────────────────────────────
 try:
     nltk.data.find('corpora/stopwords')
 except LookupError:
@@ -101,68 +79,108 @@ except LookupError:
 rake = Rake()
 rake.sentence_tokenizer = lambda text: [text]
 
-def rewrite_title(original_title, discount):
-    rake.extract_keywords_from_text(original_title)
-    phrases = rake.get_ranked_phrases()
-    top = phrases[:3]
-    if not top:
-        short = original_title if len(original_title) <= 50 else original_title[:47] + "..."
+def rewrite_title(orig, discount):
+    rake.extract_keywords_from_text(orig)
+    phrases = rake.get_ranked_phrases()[:3]
+    if not phrases:
+        short = orig if len(orig) <= 50 else orig[:47] + "..."
         return f"Save {discount}% on {short} – Shop Now!"
-    headline = " – ".join([p.title() for p in top])
+    headline = " – ".join([p.title() for p in phrases])
     return f"{headline} – Save {discount}% Now!"
+
+# ─── FETCH TITLE & IMAGE (SELENIUM) ────────────────────────────────────────────
+def fetch_full_title_and_image(url):
+    driver = init_headless_driver()
+    try:
+        # force US locale
+        full_url = url + ("&language=en_US" if "?" in url else "?language=en_US")
+        driver.get(full_url)
+
+        # wait for title OR main image
+        WebDriverWait(driver, 30).until(
+            EC.any_of(
+                EC.visibility_of_element_located((By.ID, "productTitle")),
+                EC.visibility_of_element_located((By.CSS_SELECTOR, "img#landingImage"))
+            )
+        )
+
+        # title
+        try:
+            title = driver.find_element(By.ID, "productTitle").text.strip()
+        except:
+            title = ""
+
+        # image
+        img_url = ""
+        try:
+            img_url = driver.find_element(By.CSS_SELECTOR, "img#landingImage").get_attribute("src")
+        except:
+            # fallback: first big product image
+            imgs = driver.find_elements(By.CSS_SELECTOR, "img")
+            for img in imgs:
+                src = img.get_attribute("src") or ""
+                if "media-amazon" in src and len(src) > 100:
+                    img_url = src
+                    break
+
+        return title, img_url or None
+
+    except Exception as e:
+        logging.error(f"Error fetching title/img from {url}: {e}")
+        return "", None
+    finally:
+        driver.quit()
 
 # ─── SCRAPE AMAZON DEALS ───────────────────────────────────────────────────────
 def get_amazon_deals():
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36",
-    ]
-    driver = init_headless_driver(random.choice(user_agents))
+    driver = init_headless_driver()
     try:
         driver.get("https://www.amazon.com/gp/goldbox?ie=UTF8&language=en_US")
         WebDriverWait(driver, 30).until(
             EC.presence_of_element_located((By.XPATH, "//span[contains(text(), '%')]/.."))
         )
+
         deals, seen, scrolls = [], set(), 0
         while len(deals) < DESIRED_DEALS and scrolls < MAX_SCROLLS:
             driver.execute_script("window.scrollBy(0, window.innerHeight);")
             time.sleep(random.uniform(*SCROLL_PAUSE))
             scrolls += 1
-            cards = driver.find_elements(By.XPATH, "//div[contains(@class,'DealContent-module__grid')]//a[contains(@href,'/dp/')]")
-            for card in cards:
+
+            badges = driver.find_elements(By.XPATH, "//span[contains(text(), '%')]")
+            for b in badges:
                 try:
-                    badge = card.find_element(By.XPATH, ".//span[contains(text(), '%')]")
-                    pct = int(re.search(r"(\d{1,3})%", badge.text).group(1))
+                    pct = int(re.search(r"(\d{1,3})%", b.text).group(1))
                     if pct < MIN_DISCOUNT:
                         continue
                 except:
                     continue
-                link = card.get_attribute("href").split("?",1)[0]
-                link = re.sub(r"https://www\\.amazon\\.[a-z.]+", "https://www.amazon.com", link)
+
+                try:
+                    anc = b.find_element(By.XPATH, ".//ancestor::a[contains(@href,'/dp/')]")
+                    raw = anc.get_attribute("href").split("?",1)[0]
+                    link = re.sub(r"https://www\.amazon\.[a-z.]+", "https://www.amazon.com", raw)
+                except:
+                    continue
+
                 if link in seen:
                     continue
                 seen.add(link)
-                # Extract image
-                img_url = None
-                try:
-                    img_elem = card.find_element(By.TAG_NAME, 'img')
-                    img_url = img_elem.get_attribute('src')
-                except:
-                    pass
-                temp_title = card.get_attribute('aria-label') or ''
                 deals.append({
-                    'temp_title': temp_title,
-                    'link': link,
-                    'discount': pct,
-                    'image_url': img_url
+                    "temp_title": anc.get_attribute("aria-label") or "",
+                    "link": link,
+                    "discount": pct,
                 })
         return deals
+
     finally:
         driver.quit()
 
 # ─── POST TO TELEGRAM ──────────────────────────────────────────────────────────
 def post_to_telegram(deals):
+    if not BOT_TOKEN or not CHANNEL_USERNAME:
+        logging.error("Missing Telegram credentials.")
+        return
+
     sent, used = 0, set()
     while sent < TELEGRAM_POST_COUNT and len(used) < len(deals):
         idx = random.randrange(len(deals))
@@ -170,44 +188,36 @@ def post_to_telegram(deals):
             continue
         used.add(idx)
         d = deals[idx]
-        title_raw, img_fallback = fetch_full_title_and_image(d['link'])
-        if not title_raw:
-            title_raw = d['temp_title']
-        if not d.get('image_url') and img_fallback:
-            d['image_url'] = img_fallback
-        new_ad = rewrite_title(title_raw, d['discount'])
-        link_short = shorten_link(d['link'])
-        msg = (
-            f"<b>{new_ad}</b>\n"
-            f"<a href=\"{link_short}\">Buy Now</a>"
-        )
-        if d.get('image_url'):
+
+        title, img = fetch_full_title_and_image(d["link"])
+        if not title or not img:
+            logging.warning(f"Skipping (no title/img): {d['link']}")
+            continue
+
+        ad      = rewrite_title(title, d["discount"])
+        short   = shorten_link(d["link"])
+        caption = f"<b>{ad}</b>\n<u><a href=\"{short}\">Buy Now</a></u>"
+
+        try:
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
                 data={
-                    'chat_id': CHANNEL_USERNAME,
-                    'photo': d['image_url'],
-                    'caption': msg,
-                    'parse_mode': 'HTML'
-                }
+                    "chat_id": CHANNEL_USERNAME,
+                    "photo": img,
+                    "caption": caption,
+                    "parse_mode": "HTML"
+                },
+                timeout=15
             )
-        else:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={
-                    'chat_id': CHANNEL_USERNAME,
-                    'text': msg,
-                    'parse_mode': 'HTML',
-                    'disable_web_page_preview': True
-                }
-            )
-        sent += 1
+            sent += 1
+        except Exception as e:
+            logging.error(f"Telegram send failed: {e}")
 
-# ─── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     deals = get_amazon_deals()
     if not deals:
-        print(f"No deals found with >= {MIN_DISCOUNT}% discount.")
+        print(f"No deals found with ≥{MIN_DISCOUNT}% discount.")
     else:
         post_to_telegram(deals)
-        print(f"Posted {TELEGRAM_POST_COUNT} of {len(deals)} deals.")
+        print(f"Posted {min(TELEGRAM_POST_COUNT, len(deals))} of {len(deals)} deals.")
