@@ -178,9 +178,7 @@ def post_to_telegram(deals):
         new_ad = rewrite_title(title_raw, d['discount'])
         link_short = shorten_link(d["link"])
         msg = (
-            f"<b>{new_ad}</b>
-
-"
+            f"<b>{new_ad}</b>"
             f"<u><a href=\"{link_short}\">Buy Now</a></u>"
         )
         if d.get("image_url"):
