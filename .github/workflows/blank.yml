@@ -2,7 +2,7 @@ name: Amazon Deals Cron
 
 on:
   schedule:
-    - cron: '*/15 * * * *'    # alle 15 Minuten
+   # - cron: '*/15 * * * *'    # alle 15 Minuten
   workflow_dispatch:         # manuelles Auslösen möglich
 
 jobs:
